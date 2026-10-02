@@ -61,9 +61,9 @@ Segment settings: `MIN_SPEND` (default 10000), `WINDOW_DAYS` (30),
 ## Tests
 
 ```sh
-make test-go                                  # Go: handler + lander
+make test-go                                  # Go: handler, lander, Lambda adapter, activation
 pip install -r requirements-dev.txt           # needs Java 17+ for PySpark
-make test-py                                  # ETL + segment
+make test-py                                  # ETL, Glue entry point (stubbed awsglue), segment
 ```
 
 ## Design notes
@@ -90,16 +90,57 @@ These are the behaviours worth being able to explain.
 - **Explicit schema instead of a crawler.** A raw-data schema change fails
   the job loudly instead of silently changing the table.
 
-## Moving to AWS (phase 2)
+## On AWS (phase 2)
 
-- `api`: wrap `order.Handler` in a Lambda adapter, implement `Store` with
-  DynamoDB and `Publisher` with Kinesis; deploy with SAM.
-- `lander`: replace with a Firehose delivery stream (same S3 prefix layout).
-- `etl`: run the job on Glue 5 (Spark 3.5); swap the readers for
-  `GlueContext.create_dynamic_frame` with `transformation_ctx` to use native
-  bookmarks, and read orders from the catalog.
-- `segment`: the SQL runs on Athena almost unchanged; the activation step
-  becomes a small Lambda.
+`infra/template.yaml` (AWS SAM) deploys the same design as managed services.
+The Go handler, the lander's raw-zone layout, the Spark transform and the
+segment SQL are all shared with the local stack.
+
+| Stage | Resource | Code |
+|---|---|---|
+| API | HTTP API -> Go Lambda (arm64) | `services/cmd/lambda-api`, `internal/lambdahttp` |
+| Orders | DynamoDB on-demand, PITR on | `internal/order/dynamo.go` |
+| Events | Kinesis (1 shard) -> Firehose -> S3 `raw/` | `internal/events/kinesis.go` |
+| Catalog | Glue crawler, nightly, new folders only | template |
+| ETL | Glue 5.0 job, native bookmarks, catalog-updating sink | `etl/jobs/glue_order_events.py` |
+| Orchestration | Conditional trigger: crawler SUCCEEDED -> job | template |
+| Segment | EventBridge (job SUCCEEDED) -> Lambda -> Athena -> S3 + SNS | `services/cmd/lambda-activate`, `internal/activate` |
+| Ops | Athena scan cap, S3 lifecycle, API error alarm, ETL failure alert | template |
+
+### Deploy
+
+Requires an AWS account, credentials, the AWS CLI, the SAM CLI and Go.
+
+```sh
+make lint-aws                         # offline template check
+make aws-deploy                       # sam build + deploy + upload Glue scripts
+make aws-orders N=200                 # send orders to the deployed API
+                                      # wait for the Firehose buffer (5 min by default)
+make aws-pipeline                     # crawler -> ETL -> activation, prints the segment
+make aws-destroy                      # delete the stack and all data
+```
+
+Options: `STACK_NAME` (default `dmp`), `AWS_REGION`, and template parameters
+passed to the deploy script, e.g.
+`./infra/deploy.sh FirehoseBufferSeconds=60 MinSpend=5000`.
+Subscribe to the `SegmentTopicArn` and `AlertsTopicArn` outputs (email, SQS,
+Lambda) to receive segment and failure notifications.
+
+### Cost
+
+At demo volume the stack costs roughly **$12–15 a month while it exists**,
+mostly the provisioned Kinesis shard (~$11/month). Per pipeline run, the
+crawler is ~$0.07 (10-minute minimum) and a short Glue job ~$0.05. Lambda,
+DynamoDB, Firehose, S3 and Athena are cents. Run `make aws-destroy` when done.
+
+### Differences from the local stack
+
+- The Lambda sends the Kinesis record synchronously with a 500 ms timeout:
+  a Lambda is frozen after it returns, so a background send could be lost.
+- The Glue job reads orders with a DynamoDB scan capped at 50% of read
+  capacity. At scale, switch to DynamoDB export to S3.
+- Native Glue bookmarks replace the local processed-file list; the sink also
+  registers new curated partitions, so no second crawler is needed.
 
 ## Notes
 

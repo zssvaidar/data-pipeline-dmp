@@ -1,3 +1,4 @@
 pyspark==3.5.3
 duckdb==1.5.6
 pytest>=8
+cfn-lint>=1.0

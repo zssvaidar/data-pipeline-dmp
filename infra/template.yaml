@@ -1,0 +1,385 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  data-pipeline-dmp: order API (Go Lambda) -> DynamoDB + Kinesis -> Firehose -> S3 raw zone
+  -> Glue crawler + bookmarked Glue ETL -> curated S3 -> Athena segment -> activation Lambda + SNS.
+
+Parameters:
+  CatalogPrefix:
+    Type: String
+    Default: dmp
+    AllowedPattern: "^[a-z][a-z0-9_]*$"
+    Description: Prefix for the Glue databases (<prefix>_raw, <prefix>_curated). No hyphens, for Athena.
+  FirehoseBufferSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 900
+    Description: Firehose buffering interval. Lower it (e.g. 60) for faster demos.
+  CrawlerSchedule:
+    Type: String
+    Default: cron(0 2 * * ? *)
+    Description: When the raw-zone crawler runs; the ETL job starts when it succeeds.
+  MinSpend:
+    Type: Number
+    Default: 10000
+  WindowDays:
+    Type: Number
+    Default: 30
+  AthenaBytesScannedCutoff:
+    Type: Number
+    Default: 1073741824
+    Description: Per-query scan limit for the workgroup (cost guardrail), default 1 GiB.
+
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Architectures: [arm64]
+    Handler: bootstrap
+    MemorySize: 256
+    Tracing: Active
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+  # ---------- Storage ----------
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: raw-to-infrequent-access
+            Status: Enabled
+            Prefix: raw/
+            Transitions:
+              - {StorageClass: STANDARD_IA, TransitionInDays: 30}
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: _athena-results/
+            ExpirationInDays: 7
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: order_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: order_id, KeyType: HASH}
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ---------- Ingest ----------
+  BehaviorEventsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      # One provisioned shard (~1 MB/s in) is far cheaper than on-demand at dev volume.
+      ShardCount: 1
+      RetentionPeriodHours: 24
+      StreamEncryption: {EncryptionType: KMS, KeyId: alias/aws/kinesis}
+
+  OrderApiFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ../services
+      Timeout: 10
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          EVENTS_STREAM: !Ref BehaviorEventsStream
+      Policies:
+        - DynamoDBWritePolicy: {TableName: !Ref OrdersTable}
+        - Statement:
+            - Effect: Allow
+              Action: kinesis:PutRecord
+              Resource: !GetAtt BehaviorEventsStream.Arn
+      Events:
+        CreateOrder:
+          Type: HttpApi
+          Properties:
+            Path: /orders
+            Method: POST
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: firehose.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: firehose-delivery
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [kinesis:DescribeStream, kinesis:GetShardIterator, kinesis:GetRecords, kinesis:ListShards]
+                Resource: !GetAtt BehaviorEventsStream.Arn
+              - Effect: Allow
+                Action: [s3:AbortMultipartUpload, s3:GetBucketLocation, s3:GetObject, s3:ListBucket,
+                         s3:ListBucketMultipartUploads, s3:PutObject]
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub "${DataLakeBucket.Arn}/raw/*"
+                  - !Sub "${DataLakeBucket.Arn}/errors/*"
+
+  BehaviorEventsDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt BehaviorEventsStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt DataLakeBucket.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: "raw/behavior-events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+        ErrorOutputPrefix: "errors/behavior-events/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+        BufferingHints:
+          IntervalInSeconds: !Ref FirehoseBufferSeconds
+          SizeInMBs: 64
+
+  # ---------- Catalog + ETL ----------
+  RawDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${CatalogPrefix}_raw"
+
+  CuratedDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${CatalogPrefix}_curated"
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: data-lake
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "${DataLakeBucket.Arn}/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataLakeBucket.Arn
+              - Effect: Allow
+                Action: [dynamodb:DescribeTable, dynamodb:Scan]
+                Resource: !GetAtt OrdersTable.Arn
+
+  RawEventsCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref RawDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataLakeBucket}/raw/behavior-events/"
+      Schedule:
+        ScheduleExpression: !Ref CrawlerSchedule
+      # Only list new partitions instead of re-scanning the whole raw zone.
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+      SchemaChangePolicy:
+        UpdateBehavior: LOG
+        DeleteBehavior: LOG
+      Configuration: '{"Version":1.0,"Grouping":{"TableGroupingPolicy":"CombineCompatibleSchemas"}}'
+
+  OrderEventsEtlJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      MaxRetries: 0
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataLakeBucket}/_glue/jobs/glue_order_events.py"
+      DefaultArguments:
+        --job-bookmark-option: job-bookmark-enable
+        --extra-py-files: !Sub "s3://${DataLakeBucket}/_glue/jobs/order_events_etl.py"
+        --TempDir: !Sub "s3://${DataLakeBucket}/_glue/tmp/"
+        --enable-metrics: "true"
+        --enable-continuous-cloudwatch-log: "true"
+        --enable-auto-scaling: "true"
+        --RAW_DATABASE: !Ref RawDatabase
+        --RAW_TABLE: behavior_events
+        --ORDERS_TABLE: !Ref OrdersTable
+        --CURATED_DATABASE: !Ref CuratedDatabase
+        --CURATED_TABLE: order_events
+        --CURATED_PATH: !Sub "s3://${DataLakeBucket}/curated/order_events/"
+
+  RunEtlAfterCrawl:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Type: CONDITIONAL
+      StartOnCreation: true
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            CrawlerName: !Ref RawEventsCrawler
+            CrawlState: SUCCEEDED
+      Actions:
+        - JobName: !Ref OrderEventsEtlJob
+
+  # ---------- Query + activation ----------
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-dmp"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        BytesScannedCutoffPerQuery: !Ref AthenaBytesScannedCutoff
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataLakeBucket}/_athena-results/"
+          EncryptionConfiguration: {EncryptionOption: SSE_S3}
+
+  SegmentTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+
+  ActivateFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ../services
+      Timeout: 300
+      Environment:
+        Variables:
+          ATHENA_WORKGROUP: !Ref AthenaWorkGroup
+          CURATED_DATABASE: !Ref CuratedDatabase
+          CURATED_TABLE: order_events
+          LAKE_BUCKET: !Ref DataLakeBucket
+          SEGMENT_TOPIC_ARN: !Ref SegmentTopic
+          MIN_SPEND: !Ref MinSpend
+          WINDOW_DAYS: !Ref WindowDays
+      Policies:
+        - AthenaQueryPolicy: {WorkGroupName: !Ref AthenaWorkGroup}
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt SegmentTopic.TopicName}
+        - Statement:
+            - Effect: Allow
+              Action: [glue:GetDatabase, glue:GetDatabases, glue:GetTable, glue:GetTables, glue:GetPartitions, glue:GetPartition]
+              Resource:
+                - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${CuratedDatabase}"
+                - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${CuratedDatabase}/*"
+            - Effect: Allow
+              Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+              Resource:
+                - !GetAtt DataLakeBucket.Arn
+                - !Sub "${DataLakeBucket.Arn}/curated/*"
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject, s3:AbortMultipartUpload, s3:ListMultipartUploadParts]
+              Resource:
+                - !Sub "${DataLakeBucket.Arn}/_athena-results/*"
+                - !Sub "${DataLakeBucket.Arn}/activation/*"
+      Events:
+        EtlSucceeded:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [aws.glue]
+              detail-type: [Glue Job State Change]
+              detail:
+                jobName: [!Ref OrderEventsEtlJob]
+                state: [SUCCEEDED]
+
+  # ---------- Alarms ----------
+  EtlFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Notify the segment topic's subscribers when the ETL job fails.
+      EventPattern:
+        source: [aws.glue]
+        detail-type: [Glue Job State Change]
+        detail:
+          jobName: [!Ref OrderEventsEtlJob]
+          state: [FAILED, TIMEOUT]
+      Targets:
+        - Id: alerts
+          Arn: !Ref AlertsTopic
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertsTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+
+  ApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Order API Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref OrderApiFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+  DataLakeBucket:
+    Value: !Ref DataLakeBucket
+  OrdersTable:
+    Value: !Ref OrdersTable
+  CrawlerName:
+    Value: !Ref RawEventsCrawler
+  EtlJobName:
+    Value: !Ref OrderEventsEtlJob
+  AthenaWorkGroup:
+    Value: !Ref AthenaWorkGroup
+  CuratedDatabase:
+    Value: !Ref CuratedDatabase
+  SegmentTopicArn:
+    Value: !Ref SegmentTopic
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic

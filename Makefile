@@ -1,4 +1,4 @@
-.PHONY: up down clean logs orders etl segment pipeline test test-go test-py
+.PHONY: up down clean logs orders etl segment pipeline test test-go test-py lint-aws aws-deploy aws-orders aws-pipeline aws-destroy
 
 up:            ## Start the always-on services (API, lander, Kafka, Postgres, MinIO)
 	docker compose up -d --build --wait
@@ -30,3 +30,23 @@ test-go:
 
 test-py:       ## Needs: pip install -r requirements-dev.txt (and Java 17+ for PySpark)
 	python -m pytest -q etl/tests query/tests
+
+# ---------- AWS (phase 2) ----------
+# Needs AWS credentials, the AWS CLI and the SAM CLI. STACK_NAME defaults to dmp.
+
+lint-aws:      ## Validate the CloudFormation/SAM template offline
+	cfn-lint infra/template.yaml
+
+aws-deploy:    ## Build + deploy the stack and upload the Glue scripts
+	./infra/deploy.sh
+
+aws-orders:    ## Send sample orders to the deployed API: make aws-orders N=500
+	API_URL="$$(aws cloudformation describe-stacks --stack-name $${STACK_NAME:-dmp} \
+	  --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)" \
+	  ./scripts/generate_orders.sh $(or $(N),200)
+
+aws-pipeline:  ## Run crawler -> ETL -> activation now and print the segment
+	./infra/run_pipeline.sh
+
+aws-destroy:   ## Delete the stack and all its data (asks first)
+	./infra/destroy.sh
