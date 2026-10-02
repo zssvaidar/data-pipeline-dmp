@@ -12,6 +12,8 @@ Glue -> local mapping:
   write_dynamic_frame(glueparquet, partitionKeys)            -> df.write.partitionBy("event_date").parquet
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -122,7 +124,9 @@ def run(spark: SparkSession, raw_path: str, curated_path: str, bookmark_path: st
     events = spark.read.schema(EVENT_SCHEMA).json(new_files)
     enriched = enrich(events, load_orders(spark)).cache()
     rows = enriched.count()
-    enriched.write.mode("append").partitionBy("event_date").parquet(curated_path)
+    # One file per event_date per run; without this the join's 200 shuffle
+    # partitions turn a small batch into hundreds of tiny Parquet files.
+    enriched.repartition("event_date").write.mode("append").partitionBy("event_date").parquet(curated_path)
 
     # Commit only after the write succeeded: a crash before this line means
     # the files are reprocessed next run (at-least-once), never skipped.
@@ -157,7 +161,9 @@ def build_spark() -> SparkSession:
             .config("spark.hadoop.fs.s3a.aws.credentials.provider",
                     "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
         )
-    return builder.getOrCreate()
+    spark = builder.getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
 
 
 def main() -> None:
