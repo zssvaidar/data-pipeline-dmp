@@ -55,6 +55,12 @@ Useful endpoints:
 Segment settings: `MIN_SPEND` (default 10000), `WINDOW_DAYS` (30),
 `WEBHOOK_URL` (POST the segment there), e.g. `MIN_SPEND=5000 make segment`.
 
+## Observability
+
+See [docs/observability-plan.md](docs/observability-plan.md) for the plan to add
+logs, metrics and traces (OpenTelemetry, Grafana Alloy, Loki, Prometheus,
+Tempo, Grafana).
+
 ## Tests
 
 ```sh
