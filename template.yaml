@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Site-events ingest: HTTP API -> Lambda -> Kafka (Redpanda), with logs,
+  metrics, alarms and gradual deployments.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  KafkaBootstrapServers:
+    Type: String
+    Description: Comma-separated broker list reachable from the function.
+  KafkaTopic:
+    Type: String
+    Default: site-events
+  KafkaSecurityProtocol:
+    Type: String
+    Default: SASL_SSL
+    AllowedValues: [PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL]
+  KafkaSaslMechanism:
+    Type: String
+    Default: SCRAM-SHA-256
+    AllowedValues: [PLAIN, SCRAM-SHA-256, SCRAM-SHA-512]
+  KafkaSecretArn:
+    Type: String
+    Default: ""
+    Description: Secrets Manager secret with {"username","password"}. Empty = no SASL auth.
+  DeploymentType:
+    Type: String
+    Default: AllAtOnce
+    AllowedValues: [AllAtOnce, Canary10Percent5Minutes, Linear10PercentEvery1Minute]
+    Description: Use a canary/linear type in prod so a bad version rolls back on alarm.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional email subscribed to alarm notifications.
+
+Conditions:
+  HasKafkaSecret: !Not [!Equals [!Ref KafkaSecretArn, ""]]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    MemorySize: 256
+    Timeout: 15
+    Tracing: Active
+
+Resources:
+  SiteEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub site-events-${Stage}
+      CodeUri: src/site_events/
+      Handler: app.lambda_handler
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: !Ref DeploymentType
+        Alarms:
+          - !Ref ErrorsAlarm
+          - !Ref KafkaPublishFailuresAlarm
+      LoggingConfig:
+        LogGroup: !Ref SiteEventsLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          KAFKA_BOOTSTRAP_SERVERS: !Ref KafkaBootstrapServers
+          KAFKA_TOPIC: !Ref KafkaTopic
+          KAFKA_SECURITY_PROTOCOL: !Ref KafkaSecurityProtocol
+          KAFKA_SASL_MECHANISM: !Ref KafkaSaslMechanism
+          KAFKA_SECRET_ARN: !Ref KafkaSecretArn
+          POWERTOOLS_SERVICE_NAME: site-events
+          POWERTOOLS_METRICS_NAMESPACE: SiteEvents
+          LOG_LEVEL: INFO
+      Policies:
+        - !If
+          - HasKafkaSecret
+          - AWSSecretsManagerGetSecretValuePolicy:
+              SecretArn: !Ref KafkaSecretArn
+          - !Ref AWS::NoValue
+      Events:
+        Ingest:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SiteEventsApi
+            Path: /events
+            Method: POST
+
+  SiteEventsApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 200
+        ThrottlingRateLimit: 100
+
+  # Owned by the stack so `sam delete` removes it and logs don't live forever.
+  SiteEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/site-events-${Stage}
+      RetentionInDays: 14
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Unhandled errors or timeouts in the site-events function.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub site-events-${Stage}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  ThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Invocations rejected by the concurrency limit.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub site-events-${Stage}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  DurationP99Alarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: p99 duration above 80% of the 15s timeout.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub site-events-${Stage}
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 12000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # The function answers 502 instead of crashing when Kafka is down, so the
+  # built-in Errors metric stays flat; this custom metric catches it.
+  KafkaPublishFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Events that could not be written to Kafka.
+      Namespace: SiteEvents
+      MetricName: KafkaPublishFailures
+      Dimensions:
+        - Name: service
+          Value: site-events
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub site-events-${Stage}
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type": "metric", "width": 12, "height": 6, "properties": {
+              "title": "Invocations / errors / throttles", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+              "metrics": [
+                ["AWS/Lambda", "Invocations", "FunctionName", "site-events-${Stage}"],
+                [".", "Errors", ".", "."],
+                [".", "Throttles", ".", "."]]}},
+            {"type": "metric", "width": 12, "height": 6, "properties": {
+              "title": "Duration", "region": "${AWS::Region}", "period": 60,
+              "metrics": [
+                ["AWS/Lambda", "Duration", "FunctionName", "site-events-${Stage}", {"stat": "p50"}],
+                ["...", {"stat": "p99"}]]}},
+            {"type": "metric", "width": 12, "height": 6, "properties": {
+              "title": "Events", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+              "metrics": [
+                ["SiteEvents", "EventsPublished", "service", "site-events"],
+                [".", "InvalidEvents", ".", "."],
+                [".", "KafkaPublishFailures", ".", "."]]}},
+            {"type": "metric", "width": 12, "height": 6, "properties": {
+              "title": "Kafka publish latency (ms)", "region": "${AWS::Region}", "period": 60,
+              "metrics": [
+                ["SiteEvents", "KafkaPublishLatency", "service", "site-events", {"stat": "p50"}],
+                ["...", {"stat": "p99"}]]}}
+          ]
+        }
+
+Outputs:
+  EventsUrl:
+    Description: POST site events here.
+    Value: !Sub https://${SiteEventsApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/events
+  FunctionName:
+    Value: !Ref SiteEventsFunction
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic

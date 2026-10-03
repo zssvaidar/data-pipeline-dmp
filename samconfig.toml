@@ -1,0 +1,24 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "site-events-dev"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.local_start_api.parameters]
+env_vars = "env.local.json"
+docker_network = "dmp-local"
+warm_containers = "EAGER"
+parameter_overrides = "KafkaBootstrapServers=redpanda:9092 KafkaSecurityProtocol=PLAINTEXT"
+
+[default.local_invoke.parameters]
+env_vars = "env.local.json"
+docker_network = "dmp-local"
+parameter_overrides = "KafkaBootstrapServers=redpanda:9092 KafkaSecurityProtocol=PLAINTEXT"
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true

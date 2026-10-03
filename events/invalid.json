@@ -1,0 +1,9 @@
+{
+  "version": "2.0",
+  "routeKey": "POST /events",
+  "rawPath": "/events",
+  "headers": {"content-type": "application/json"},
+  "requestContext": {"http": {"method": "POST", "path": "/events"}},
+  "body": "{\"event_type\": \"bogus_event\"}",
+  "isBase64Encoded": false
+}

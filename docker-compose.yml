@@ -1,0 +1,42 @@
+# Local Kafka for the Lambda. The function itself runs via `sam local`,
+# which attaches its containers to the `dmp-local` network below.
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda start
+      - --mode dev-container
+      - --smp 1
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - rpk topic create site-events -p 3 -X brokers=redpanda:9092 || true
+    restart: "no"
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+networks:
+  default:
+    name: dmp-local
